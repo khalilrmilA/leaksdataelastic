@@ -6,15 +6,22 @@ from urllib.parse import urlparse
 
 import tldextract
 import requests
-from tqdm import tqdm
 from elasticsearch import Elasticsearch, helpers
+from concurrent.futures import ThreadPoolExecutor
+
+import threading
+
 
 # =========================
 # CONFIG (EDIT THESE)
 # =========================
-LEAK_ROOT = r"E:\TelegramDownloads\@BRADMAX"
+LEAK_ROOT = r"E:\TelegramDownloads\httpst.meCLOUDCASPERLINK"
 ES_URL = "http://localhost:9200"
 INDEX_NAME = "leaks_data"
+
+MAX_WORKERS = min(8, os.cpu_count() or 4)
+print_lock = threading.Lock()
+
 
 # Optional (only if you want live IP geo lookup)
 IPINFO_TOKEN = None  # e.g. "xxxx"
@@ -235,26 +242,33 @@ def parse_passwords_txt(path: str):
 
     def emit():
         nonlocal soft, host, login, password
-        if host and login is not None and password is not None:
-            dom = safe_domain(host)
-            pw_is_json = False
-            pw = password.strip()
-            if pw.startswith("{") and pw.endswith("}"):
-                pw_is_json = True
-            yield {
-                "soft": (soft or "").strip() or None,
-                "host": host.strip(),
-                "domain": dom,
-                "login": login.strip(),
-                "password": pw,
-                "password_is_json": pw_is_json,
-            }
+
+        if not (host and login is not None and password is not None):
+            return
+
+        dom = safe_domain(host)
+
+        pw = password.strip()
+        pw_is_json = pw.startswith("{") and pw.endswith("}")
+
+        emails = []
+        if login and EMAIL_REGEX.search(login):
+            emails = [login.lower()]
+
+        yield {
+            "soft": (soft or "").strip() or None,
+            "host": host.strip(),
+            "domain": dom,
+            "login": login.strip(),
+            "emails": emails,
+            "password": pw,
+            "password_is_json": pw_is_json,
+        }
 
     for ln in lines + [""]:  # force flush at end
         s = ln.strip()
 
         if not s:
-            # end of block
             for item in emit():
                 yield item
             soft = host = login = password = None
@@ -334,75 +348,129 @@ def parse_autofill_txt(path: str):
 # Folder logic (your requested priority)
 # =========================
 def find_root_priority_files(victim_dir: str):
-    """
-    Return dict like:
-      {"passwords": "...", "information": "..."}
-    if found in victim root.
-    """
     found = {}
 
     try:
-        for name in os.listdir(victim_dir):
-            low = name.lower()
-            base = os.path.splitext(low)[0]
+        for root, _, files in os.walk(victim_dir):
+            for name in files:
+                low = name.lower()
+                base = os.path.splitext(low)[0]
 
-            if not low.endswith(".txt"):
-                continue
+                if not low.endswith(".txt"):
+                    continue
 
-            for pref in ROOT_PRIORITY_FILES:
-                if base.startswith(pref):
-                    found[pref] = os.path.join(victim_dir, name)
+                full_path = os.path.join(root, name)
+
+                matched = False
+                for pref in ROOT_PRIORITY_FILES:
+                    if base.startswith(pref):
+                        found[pref] = full_path
+                        matched = True
+                        break
+
+                if not matched:
+                    found.setdefault("unknown", []).append(full_path)
+
     except Exception:
         pass
 
     return found
 
 
+
+def parse_generic_txt(path: str):
+    try:
+        for ln in open(path, "r", errors="ignore"):
+            ln = ln.strip()
+            if ln:
+                yield ln[:5000]
+    except Exception:
+        return
+
+
 def find_autofill_files(victim_dir: str):
-    """
-    Find Autofill folder and return allowed txt file paths.
-    """
     results = []
     try:
-        for name in os.listdir(victim_dir):
-            full = os.path.join(victim_dir, name)
-            if not os.path.isdir(full):
-                continue
-            if any(k.lower() in name.lower() for k in AUTOFILL_DIR_NAMES):
-                # list files inside autofill folder
-                for fn in os.listdir(full):
+        for root, dirs, files in os.walk(victim_dir):
+            dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+
+            if any(k.lower() in root.lower() for k in AUTOFILL_DIR_NAMES):
+                for fn in files:
                     if not fn.lower().endswith(".txt"):
                         continue
                     base = os.path.splitext(fn)[0]
                     if any(base.lower() == a.lower() for a in AUTOFILL_FILES_ALLOWLIST):
-                        results.append(os.path.join(full, fn))
+                        results.append(os.path.join(root, fn))
     except Exception:
         pass
+
     return results
+
+
 
 
 # =========================
 # Victim directory finder (recursive, robust)
 # =========================
+SKIP_DIRS = {"cookies", "history"}
+
+
 def find_victim_dirs(root: str):
     """
-    Recursively find directories that contain passwords.txt or information.txt.
-    A victim folder is one that contains these marker files.
+    Find ANY directory that contains at least one .txt file
+    Ignore Cookies / History everywhere
     """
     victims = set()
+
     for current, dirs, files in os.walk(root):
-        # A victim folder is one that contains passwords.txt or information.txt
-        for f in files:
-            low = f.lower()
-            if low.startswith(("passwords", "information")) and low.endswith(".txt"):
-                victims.add(current)
-                break
+        # skip junk dirs
+        dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+
+        if any(f.lower().endswith(".txt") for f in files):
+            victims.add(current)
+
     return sorted(victims)
 
+def log_dir(msg):
+    print(msg, flush=True)
 
 # =========================
 # Ingest
 # =========================
+def process_passwords(pw_path, info_context, victim_name, victim_dir):
+    local_actions = []
+
+    for cred in parse_passwords_txt(pw_path):
+        doc = {
+            "doc_type": "credential",
+            "timestamp": datetime.now(timezone.utc),
+            "victim_folder": victim_name,
+            "source_file": os.path.basename(pw_path),
+            "source_path": victim_dir,
+            "ip": info_context.get("ip"),
+            "country": info_context.get("country"),
+            "os": info_context.get("os"),
+            "user_name": info_context.get("user_name"),
+            "computer_name": info_context.get("computer_name"),
+            **cred,
+        }
+
+        _id = sha1_id(
+            "credential",
+            victim_name,
+            doc.get("host") or "",
+            doc.get("login") or "",
+            doc.get("password") or "",
+        )
+
+        local_actions.append({
+            "_index": INDEX_NAME,
+            "_id": _id,
+            "_source": doc
+        })
+
+    return local_actions
+
 def ingest():
     ensure_index()
 
@@ -410,13 +478,15 @@ def ingest():
     victim_dirs = find_victim_dirs(LEAK_ROOT)
 
     print(f"✅ Victim folders found: {len(victim_dirs)}")
-
-    for victim_dir in tqdm(victim_dirs, desc="Ingesting folders"):
+    total = len(victim_dirs)
+    for idx, victim_dir in enumerate(victim_dirs, 1):
+        log_dir(f"\n📂 [{idx}/{total}] Scanning:\n{victim_dir}")
         victim_name = os.path.relpath(victim_dir, LEAK_ROOT)
-
         root_files = find_root_priority_files(victim_dir)
 
-        # 1) First parse information/passwords in victim root (if present)
+        # =========================
+        # 1) information.txt
+        # =========================
         info_context = {}
         if "information" in root_files:
             info_path = root_files["information"]
@@ -428,88 +498,94 @@ def ingest():
                 "victim_folder": victim_name,
                 "source_file": os.path.basename(info_path),
                 "source_path": victim_dir,
-                **info_context
+                **info_context,
             }
 
             _id = sha1_id("host_info", victim_name, info_path)
-            actions.append({"_index": INDEX_NAME, "_id": _id, "_source": doc})
+            actions.append({
+                "_index": INDEX_NAME,
+                "_id": _id,
+                "_source": doc
+            })
 
+        # =========================
+        # 2) passwords.txt
+        # =========================
         if "passwords" in root_files:
-            pw_path = root_files["passwords"]
-            for cred in parse_passwords_txt(pw_path):
-                # attach ip/country from information.txt if available
-                ip = info_context.get("ip")
-                country = info_context.get("country")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future = executor.submit(
+                    process_passwords,
+                    root_files["passwords"],
+                    info_context,
+                    victim_name,
+                    victim_dir
+                )
+                actions.extend(future.result())
 
-                # optional: live IP lookup only if enabled
-                city = None
-                if IPINFO_TOKEN and ip:
-                    ctry2, city2 = ip_lookup(ip)
-                    country = country or ctry2
-                    city = city2
+                # =========================
+                # 2b) unknown txt files (once per directory)
+                # =========================
+        #if "unknown" in root_files:
+         #   for txt in root_files["unknown"]:
+          #      for line in parse_generic_txt(txt):
+           #         doc = {
+            #            "doc_type": "raw_txt",
+             #           "timestamp": datetime.now(timezone.utc),
+              #          "victim_folder": victim_name,
+               ##         "source_file": os.path.basename(txt),
+                 #       "source_path": victim_dir,
+                  #      "value": line,
+                   # }
+#
+ ##                   _id = sha1_id("raw_txt", victim_name, txt, line)
+#
+ #                   actions.append({
+  #                      "_index": INDEX_NAME,
+   #                     "_id": _id,
+    ####                    "_source": doc
+        #            })
 
+
+
+        # =========================
+        # 3) Autofill (ONCE per victim)
+        # =========================
+        autofill_files = find_autofill_files(victim_dir)
+        for af_path in autofill_files:
+            for item in parse_autofill_txt(af_path):
                 doc = {
-                    "doc_type": "credential",
+                    "doc_type": "autofill",
                     "timestamp": datetime.now(timezone.utc),
                     "victim_folder": victim_name,
-                    "source_file": os.path.basename(pw_path),
-                    "source_path": victim_dir,
-                    "ip": ip,
-                    "country": country,
-                    "city": city,
-                    "os": info_context.get("os"),
-                    "user_name": info_context.get("user_name"),
-                    "computer_name": info_context.get("computer_name"),
-                    **cred
+                    "source_file": os.path.basename(af_path),
+                    "source_path": os.path.dirname(af_path),
+                    "field": item["field"],
+                    "value": item["value"],
+                    "value_keyword": item["value"][:2048],
+                    "emails": item["emails"],
+                    "phones": item["phones"],
                 }
 
                 _id = sha1_id(
-                    "credential",
+                    "autofill",
                     victim_name,
-                    doc.get("host") or "",
-                    doc.get("login") or "",
-                    doc.get("password") or ""
+                    doc["source_file"],
+                    doc["field"],
+                    doc["value"],
                 )
 
-                actions.append({"_index": INDEX_NAME, "_id": _id, "_source": doc})
+                actions.append({
+                    "_index": INDEX_NAME,
+                    "_id": _id,
+                    "_source": doc
+                })
+        flush_bulk(actions)
+        log_dir(f"✅ Finished & pushed: {victim_name}")
+        # =========================
+        # Bulk flush
+        # =========================
 
-        # If we found either passwords or information, we STOP here (your request)
-        if ("passwords" in root_files) or ("information" in root_files):
-            pass
-        else:
-            # 2) Otherwise parse Autofill folder (Google/Microsoft only)
-            autofill_files = find_autofill_files(victim_dir)
-            for af_path in autofill_files:
-                for item in parse_autofill_txt(af_path):
-                    doc = {
-                        "doc_type": "autofill",
-                        "timestamp": datetime.now(timezone.utc),
-                        "victim_folder": victim_name,
-                        "source_file": os.path.basename(af_path),
-                        "source_path": os.path.dirname(af_path),
-                        "field": item["field"],
-                        "value": item["value"],
-                        "value_keyword": item["value"][:2048],
-                        "emails": item["emails"],
-                        "phones": item["phones"],
-                    }
 
-                    _id = sha1_id(
-                        "autofill",
-                        victim_name,
-                        doc["source_file"],
-                        doc["field"],
-                        doc["value"]
-                    )
-                    actions.append({"_index": INDEX_NAME, "_id": _id, "_source": doc})
-
-        # Flush bulk
-        if len(actions) >= BULK_SIZE:
-            flush_bulk(actions)
-
-    # final flush
-    flush_bulk(actions)
-    print("✅ Done.")
 
 
 def flush_bulk(actions):
