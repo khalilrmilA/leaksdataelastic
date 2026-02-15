@@ -17,6 +17,9 @@ INPUT_FILE = r"C:\Users\khali\Downloads\leaks\@logsredbot [5.2M] #3933.txt"  # C
 ES_URL = "http://localhost:9200"
 INDEX_NAME = "leaks_data"
 
+# Output file for invalid lines
+INVALID_OUTPUT_FILE = None  # Will be auto-generated based on INPUT_FILE
+
 # Performance settings
 BULK_SIZE = 5000  # Increased for better performance
 CHUNK_SIZE = 50000  # Process this many lines per thread
@@ -25,6 +28,7 @@ MAX_WORKERS = min(16, (os.cpu_count() or 4) * 2)  # More threads for I/O-bound t
 es = Elasticsearch(ES_URL)
 stats_lock = threading.Lock()
 print_lock = threading.Lock()
+file_lock = threading.Lock()  # Lock for writing to invalid file
 
 
 # =========================
@@ -137,17 +141,19 @@ def parse_leak_line(line: str) -> dict | None:
 # =========================
 # Processing chunks
 # =========================
-def process_chunk(lines_chunk, chunk_num, source_file, source_path):
+def process_chunk(lines_chunk, chunk_num, source_file, source_path, invalid_file_path):
     """Process a chunk of lines and return actions for bulk insert."""
     actions = []
     valid = 0
     invalid = 0
+    invalid_lines = []
 
     for line in lines_chunk:
         parsed = parse_leak_line(line)
 
         if not parsed:
             invalid += 1
+            invalid_lines.append(line.rstrip('\n\r'))
             continue
 
         valid += 1
@@ -182,7 +188,23 @@ def process_chunk(lines_chunk, chunk_num, source_file, source_path):
             "_source": doc
         })
 
+    # Write invalid lines to file
+    if invalid_lines and invalid_file_path:
+        write_invalid_lines(invalid_lines, invalid_file_path)
+
     return actions, valid, invalid, chunk_num
+
+
+def write_invalid_lines(lines, file_path):
+    """Thread-safe writing of invalid lines to output file."""
+    with file_lock:
+        try:
+            with open(file_path, "a", encoding="utf-8", errors="ignore") as f:
+                for line in lines:
+                    f.write(line + "\n")
+        except Exception as e:
+            with print_lock:
+                print(f"⚠️ Error writing invalid lines: {e}")
 
 
 # =========================
@@ -194,6 +216,24 @@ def ingest_file():
     if not os.path.exists(INPUT_FILE):
         print(f"❌ File not found: {INPUT_FILE}")
         return
+
+    # Generate output file path for invalid lines
+    base_name = os.path.splitext(os.path.basename(INPUT_FILE))[0]
+    invalid_file_path = os.path.join(
+        os.path.dirname(INPUT_FILE),
+        f"{base_name}_INVALID.txt"
+    )
+
+    # Clear/create the invalid file
+    try:
+        with open(invalid_file_path, "w", encoding="utf-8") as f:
+            f.write(f"# Invalid lines from: {INPUT_FILE}\n")
+            f.write(f"# Generated: {datetime.now()}\n")
+            f.write("#" + "="*70 + "\n\n")
+        print(f"📝 Invalid lines will be saved to: {invalid_file_path}\n")
+    except Exception as e:
+        print(f"⚠️ Could not create invalid file: {e}")
+        invalid_file_path = None
 
     print(f"📄 Processing file: {INPUT_FILE}")
     print(f"⚙️  Using {MAX_WORKERS} worker threads")
@@ -226,7 +266,8 @@ def ingest_file():
                             chunk,
                             chunk_num,
                             source_file,
-                            source_path
+                            source_path,
+                            invalid_file_path
                         )
                         futures.append(future)
                         chunk = []
@@ -243,7 +284,8 @@ def ingest_file():
                         chunk,
                         chunk_num,
                         source_file,
-                        source_path
+                        source_path,
+                        invalid_file_path
                     )
                     futures.append(future)
 
@@ -264,6 +306,8 @@ def ingest_file():
     print(f"✅ Valid entries: {total_valid:,}")
     print(f"❌ Invalid/skipped: {total_invalid:,}")
     print(f"📈 Success rate: {(total_valid/total_lines*100):.2f}%")
+    if invalid_file_path and total_invalid > 0:
+        print(f"📝 Invalid lines saved to: {invalid_file_path}")
     print("="*50)
 
 
