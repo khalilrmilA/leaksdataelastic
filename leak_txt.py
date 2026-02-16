@@ -13,12 +13,17 @@ from elasticsearch import Elasticsearch, helpers
 # =========================
 # CONFIG (EDIT THESE)
 # =========================
-INPUT_FILE = r"C:\Users\khali\Downloads\leaks\@logsredbot [5.2M] #3933.txt"  # Change this to your file path
+# Option 1: Single file
+INPUT_FILE = None  # Set to a specific file path, or None to use INPUT_FOLDER
+
+# Option 2: Process all .txt files in a folder (excluding _INVALID.txt files)
+INPUT_FOLDER = r"C:\Users\khali\Downloads\leaks"  # Folder containing leak files
+
+# Option 3: Pattern matching (e.g., "*.txt" or "@logsredbot*.txt")
+FILE_PATTERN = "*.txt"  # Pattern to match files in INPUT_FOLDER
+
 ES_URL = "http://localhost:9200"
 INDEX_NAME = "leaks_data"
-
-# Output file for invalid lines
-INVALID_OUTPUT_FILE = None  # Will be auto-generated based on INPUT_FILE
 
 # Performance settings
 BULK_SIZE = 5000  # Increased for better performance
@@ -83,7 +88,9 @@ def safe_domain(host_or_url: str | None) -> str | None:
 # =========================
 def parse_leak_line(line: str) -> dict | None:
     """
-    Parse line in format: URL:email:pass
+    Parse line in two formats:
+    1. URL:email:pass
+    2. email:pass (no URL)
     Returns dict with extracted data or None if invalid.
     """
     line = line.strip()
@@ -93,7 +100,7 @@ def parse_leak_line(line: str) -> dict | None:
     # Find all colons in the line
     parts = line.split(":")
 
-    if len(parts) < 3:
+    if len(parts) < 2:  # Changed from 3 to 2 to handle email:pass format
         return None
 
     # Strategy: Find the email in the parts (it will have @)
@@ -108,7 +115,7 @@ def parse_leak_line(line: str) -> dict | None:
         return None
 
     # Reconstruct URL (everything before email)
-    url = ":".join(parts[:email_idx])
+    url = ":".join(parts[:email_idx]) if email_idx > 0 else None
 
     # Email is at email_idx
     email = parts[email_idx].strip()
@@ -130,7 +137,7 @@ def parse_leak_line(line: str) -> dict | None:
     url_domain = safe_domain(url) if url else None
 
     return {
-        "url": url,
+        "url": url or "",  # Empty string if no URL
         "url_domain": url_domain,
         "email": email.lower(),
         "email_domain": email_domain,
@@ -208,26 +215,59 @@ def write_invalid_lines(lines, file_path):
 
 
 # =========================
-# Ingest
+# File discovery
 # =========================
-def ingest_file():
-    """Read the input file and ingest to Elasticsearch using multi-threading."""
+def find_leak_files():
+    """Find all leak files to process based on configuration."""
+    files_to_process = []
 
-    if not os.path.exists(INPUT_FILE):
-        print(f"❌ File not found: {INPUT_FILE}")
+    if INPUT_FILE:
+        # Single file mode
+        if os.path.exists(INPUT_FILE):
+            files_to_process.append(INPUT_FILE)
+        else:
+            print(f"❌ File not found: {INPUT_FILE}")
+    elif INPUT_FOLDER:
+        # Folder mode with pattern matching
+        if not os.path.exists(INPUT_FOLDER):
+            print(f"❌ Folder not found: {INPUT_FOLDER}")
+            return []
+
+        import glob
+        pattern_path = os.path.join(INPUT_FOLDER, FILE_PATTERN)
+        all_files = glob.glob(pattern_path)
+
+        # Filter out _INVALID.txt files
+        for f in all_files:
+            if not f.endswith("_INVALID.txt"):
+                files_to_process.append(f)
+
+        files_to_process.sort()  # Process in alphabetical order
+
+    return files_to_process
+
+
+# =========================
+# Ingest single file
+# =========================
+def ingest_single_file(input_file):
+    """Read a single input file and ingest to Elasticsearch using multi-threading."""
+
+    if not os.path.exists(input_file):
+        print(f"❌ File not found: {input_file}")
         return
 
     # Generate output file path for invalid lines
-    base_name = os.path.splitext(os.path.basename(INPUT_FILE))[0]
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
     invalid_file_path = os.path.join(
-        os.path.dirname(INPUT_FILE),
+        os.path.dirname(input_file),
         f"{base_name}_INVALID.txt"
     )
 
     # Clear/create the invalid file
     try:
         with open(invalid_file_path, "w", encoding="utf-8") as f:
-            f.write(f"# Invalid lines from: {INPUT_FILE}\n")
+            f.write(f"# Invalid lines from: {input_file}\n")
             f.write(f"# Generated: {datetime.now()}\n")
             f.write("#" + "="*70 + "\n\n")
         print(f"📝 Invalid lines will be saved to: {invalid_file_path}\n")
@@ -235,20 +275,24 @@ def ingest_file():
         print(f"⚠️ Could not create invalid file: {e}")
         invalid_file_path = None
 
-    print(f"📄 Processing file: {INPUT_FILE}")
+    print(f"📄 Processing file: {input_file}")
     print(f"⚙️  Using {MAX_WORKERS} worker threads")
     print(f"📦 Chunk size: {CHUNK_SIZE:,} lines per chunk")
     print(f"📊 Bulk size: {BULK_SIZE:,} documents per batch\n")
 
-    source_file = os.path.basename(INPUT_FILE)
-    source_path = os.path.dirname(INPUT_FILE)
+    source_file = os.path.basename(input_file)
+    source_path = os.path.dirname(input_file)
 
     total_lines = 0
     total_valid = 0
     total_invalid = 0
 
+    # Reset global stats for this file
+    global stats
+    stats = {"valid": 0, "invalid": 0, "chunks": 0}
+
     try:
-        with open(INPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = []
                 chunk = []
@@ -380,5 +424,39 @@ def flush_bulk(actions):
         actions.clear()
 
 
+def ingest_all_files():
+    """Main function to process all configured leak files."""
+
+    files = find_leak_files()
+
+    if not files:
+        print("❌ No files found to process!")
+        print("   Check your configuration:")
+        print(f"   - INPUT_FILE: {INPUT_FILE}")
+        print(f"   - INPUT_FOLDER: {INPUT_FOLDER}")
+        print(f"   - FILE_PATTERN: {FILE_PATTERN}")
+        return
+
+    print("="*70)
+    print(f"🔍 Found {len(files)} file(s) to process:")
+    for i, f in enumerate(files, 1):
+        file_size = os.path.getsize(f) / (1024 * 1024)  # MB
+        print(f"   {i}. {os.path.basename(f)} ({file_size:.2f} MB)")
+    print("="*70 + "\n")
+
+    for i, file_path in enumerate(files, 1):
+        print(f"\n{'='*70}")
+        print(f"📂 Processing file {i}/{len(files)}")
+        print(f"{'='*70}\n")
+
+        ingest_single_file(file_path)
+
+        print(f"\n✅ Completed file {i}/{len(files)}: {os.path.basename(file_path)}\n")
+
+    print("\n" + "="*70)
+    print(f"🎉 All {len(files)} file(s) processed successfully!")
+    print("="*70)
+
+
 if __name__ == "__main__":
-    ingest_file()
+    ingest_all_files()
