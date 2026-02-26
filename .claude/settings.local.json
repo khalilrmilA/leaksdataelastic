@@ -4,7 +4,15 @@
       "Bash(python:*)",
       "Bash(python3:*)",
       "Bash(pip install:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(docker compose up:*)",
+      "Bash(docker compose down:*)",
+      "Bash(until curl -s http://localhost:9200/_cluster/health)",
+      "Bash(do sleep 3)",
+      "Bash(done)",
+      "Bash(until curl -s http://localhost:5601/api/status)",
+      "Bash(do sleep 5)",
+      "Bash(docker restart:*)"
     ]
   }
 }
