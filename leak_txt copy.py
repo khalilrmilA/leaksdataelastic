@@ -82,7 +82,7 @@ def extract_domain_from_email(email: str) -> str | None:
     try:
         domain_part = email.split("@")[1]
         ext = tldextract.extract(domain_part)
-        return ext.top_domain_under_public_suffix or domain_part
+        return ext.registered_domain or domain_part
     except Exception:
         return None
 
@@ -96,9 +96,9 @@ def safe_domain(host_or_url: str | None) -> str | None:
         u = urlparse(host_or_url)
         if u.scheme and u.netloc:
             ext = tldextract.extract(u.netloc)
-            return ext.top_domain_under_public_suffix or u.netloc
+            return ext.registered_domain or u.netloc
         ext = tldextract.extract(host_or_url)
-        return ext.top_domain_under_public_suffix or host_or_url
+        return ext.registered_domain or host_or_url
     except Exception:
         return None
 
@@ -135,9 +135,10 @@ def _parse_hash_format(line: str) -> dict | None:
 
     url_domain = safe_domain(url_part)
     if not url_domain:
-        return None  # first segment is not a real URL → skip
+        return None  # first segment isn't a real URL → not a credential
 
     if "@" not in rest:
+        # No '@' at all → treat rest as username, no password
         return {
             "url":          url_part,
             "url_domain":   url_domain,
@@ -161,7 +162,7 @@ def _parse_hash_format(line: str) -> dict | None:
             "password":     password,
         }
 
-    # No valid email → split on the last '@'
+    # No valid email → split on the last '@': everything before = login, after = password
     at_idx   = rest.rfind("@")
     login    = rest[:at_idx]
     password = rest[at_idx + 1:]
@@ -234,7 +235,7 @@ def parse_leak_line(line: str) -> dict | None:
                 "password":     password,
             }
 
-    # ── No valid email → try url:username:password ────────────────────────
+    # ── No valid email found → try url:username:password ─────────────────
     url        = ":".join(parts[:url_end])
     url_domain = safe_domain(url)
     remaining  = parts[url_end:]
@@ -275,10 +276,6 @@ def process_chunk(lines_chunk, chunk_num, source_file, source_path, invalid_file
 
         valid += 1
 
-        email    = parsed["email"]
-        username = parsed["username"]
-        login    = email or username or ""
-
         doc = {
             "doc_type":        "credential",
             "timestamp":       datetime.now(timezone.utc),
@@ -288,8 +285,8 @@ def process_chunk(lines_chunk, chunk_num, source_file, source_path, invalid_file
             "url_domain":      parsed["url_domain"],
             "host":            parsed["url"],
             "domain":          parsed["email_domain"],
-            "login":           login,
-            "emails":          [email] if email else [],
+            "login":           parsed["email"],
+            "emails":          [parsed["email"]],
             "password":        parsed["password"],
             "password_is_json": False,
         }

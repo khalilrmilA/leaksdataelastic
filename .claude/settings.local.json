@@ -12,7 +12,8 @@
       "Bash(done)",
       "Bash(until curl -s http://localhost:5601/api/status)",
       "Bash(do sleep 5)",
-      "Bash(docker restart:*)"
+      "Bash(docker restart:*)",
+      "Bash(wc -l \"/home/sysadmin/Downloads/@DaxusProBot #100 - 4.06 M+ ULP_INVALID.txt\" \"/home/sysadmin/Downloads/@logsredbot [9.5M] #3320_INVALID.txt\" \"/home/sysadmin/Downloads/Subscribe TG @StarLinkClouds & @StarLinkClub [ULP] 555.994.039 kk_INVALID.txt\")"
     ]
   }
 }
